@@ -8,14 +8,17 @@ use rand::{
 use std::collections::HashMap;
 
 fn main() {
-    App::build()
+    App::new()
         .add_plugins(DefaultPlugins)
-        .add_resource(SoftDropTimer(Timer::from_seconds(0.750, true)))
-        .add_resource(PrintInfoTimer(Timer::from_seconds(1.0, true)))
-        .add_startup_system(setup.system())
-        .add_system(print_info.system())
-        .add_system(move_current_tetromino.system())
-        .add_system(update_block_sprites.system())
+        .insert_resource(UpdateTimer(Timer::from_seconds(0.08, true)))
+        .insert_resource(SoftDropTimer(Timer::from_seconds(0.450, true)))
+        .insert_resource(PrintInfoTimer(Timer::from_seconds(0.8, true)))
+
+        .add_startup_system(setup)
+        //.add_system(print_info)
+        .add_system(move_current_tetromino)
+        .add_system(update_block_sprites)
+        .add_system(clear_full_layers)
         .run();
 }
 
@@ -23,17 +26,20 @@ struct SoftDropTimer(Timer);
 
 struct PrintInfoTimer(Timer);
 
+struct UpdateTimer(Timer);
 // Base entity, everything is made out of blocks
+#[derive(Component)]
 struct Block {
     color: Color,
 }
-
+#[derive(Component)]
 struct Matrix {
     width: i32,
     height: i32,
 }
 
 // Holds a block's position within a tetromino for rotation
+#[derive(Component)]
 #[derive(Debug)]
 struct MatrixPosition {
     x: i32,
@@ -42,6 +48,7 @@ struct MatrixPosition {
 
 // A block can be part of a tetromino. Stores the block's index within that
 // tetromino for the purpose of rotation.
+#[derive(Component)]
 #[derive(Debug)]
 struct Tetromino {
     tetromino_type: TetrominoType,
@@ -49,30 +56,28 @@ struct Tetromino {
 }
 
 // A block can be part of the currently controlled tetromino.
+#[derive(Component)]
 struct CurrentTetromino;
 
-// A block can be part of the currently held tetromino.
-struct HeldTetromino;
 
-// Tracks whether a tetromino was already held since the last tetromino was
-// added to the heap.
-struct AlreadyHeld(bool);
-
-// A block can be part of one of the tetrominos that are next in line.
-struct NextTetromino {
-    pos_in_line: u8,
-}
 
 // A block can be part of the heap.
+#[derive(Component)]
 struct Heap;
 
 impl Block {
     const SIZE: f32 = 25.0;
 }
 
+#[derive(Component)]
+struct ScoreText;
+
+
+
 fn setup(
-    commands: &mut Commands,
-    mut materials: ResMut<Assets<ColorMaterial>>
+    mut commands: Commands,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    asset_server: Res<AssetServer>
 ) {
     let matrix = Matrix {
         width: 10,
@@ -80,29 +85,60 @@ fn setup(
     };
 
     commands
-        .spawn(Camera2dBundle::default())
-        .spawn(CameraUiBundle::default())
+        .spawn()
+        .insert_bundle(OrthographicCameraBundle::new_2d());
+    commands.spawn().insert_bundle(UiCameraBundle::default())
     ;
 
-    spawn_current_tetromino(commands, &matrix, &mut materials);
-
+    spawn_current_tetromino(&mut commands, &matrix, &mut materials);
+    let mysprite = Sprite {
+        color: Color::rgb(0.0, 0.0, 0.0).into(),
+        flip_x: false,
+        flip_y: false,
+        custom_size: Some(Vec2::new(matrix.width as f32 * Block::SIZE, matrix.height as f32 * Block::SIZE)),
+    };
     commands
-        .spawn(SpriteBundle {
-            material: materials.add(Color::rgb(0.0, 0.0, 0.0).into()),
-            sprite: Sprite::new(Vec2::new(matrix.width as f32 * Block::SIZE, matrix.height as f32 * Block::SIZE)),
+        .spawn().insert_bundle(SpriteBundle {
+            sprite: mysprite,
             ..Default::default()
         })
-        .with(matrix)
+        .insert(matrix)
     ;
+    commands.spawn_bundle(TextBundle {
+                text: Text::with_section(
+                // Accepts a `String` or any type that converts into a `String`, such as `&str`
+                "Score: ",
+                TextStyle {
+                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+                    font_size: 100.0,
+                    color: Color::WHITE,
+                },
+                // Note: You can use `Default::default()` in place of the `TextAlignment`
+                TextAlignment {
+                    horizontal: HorizontalAlign::Center,
+                    ..Default::default()
+                },
+            ),
+            style: Style {
+                position_type: PositionType::Absolute,
+                position: Rect {
+                    top: Val::Px(5.0),
+                    left: Val::Px(5.0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        });
 }
 
-fn print_info(
+fn _print_info(
     time: Res<Time>,
     mut timer: ResMut<PrintInfoTimer>,
-    mut matrix_query: Query<(&Matrix, &Sprite, &Transform)>,
+    mut _matrix_query: Query<(&Matrix, &Sprite, &Transform)>,
     mut current_query: Query<(Entity, &MatrixPosition, &Tetromino, &CurrentTetromino)>
 ) {
-    timer.0.tick(time.delta_seconds());
+    timer.0.tick(time.delta());
 
     if timer.0.just_finished() {
         for (entity, position, tetromino, _current) in current_query.iter_mut() {
@@ -114,43 +150,48 @@ fn print_info(
 }
 
 fn move_current_tetromino(
-    commands: &mut Commands,
+    mut commands: Commands,
     mut materials: ResMut<Assets<ColorMaterial>>,
     time: Res<Time>,
     mut soft_drop_timer: ResMut<SoftDropTimer>,
     keyboard_input: Res<Input<KeyCode>>,
     mut matrix_query: Query<&Matrix>,
-    mut current_query: Query<(Entity, &mut MatrixPosition, &mut Tetromino, &CurrentTetromino)>,
-    mut heap_query: Query<(&mut MatrixPosition, &Heap)>
+    mut current_query: Query<(Entity, &mut MatrixPosition, &mut Tetromino, &CurrentTetromino), Without<Heap>>,
+    mut heap_query: Query<(Entity, &mut MatrixPosition, &Heap)>
 ) {
+    soft_drop_timer.0.tick(time.delta()).just_finished();
+    
     // Store current positions in map by entity ID
     let mut prev_positions: HashMap<u32, (i32, i32)> = HashMap::new();
     for (entity, position, _tetromino, _current) in current_query.iter_mut() {
         prev_positions.insert(entity.id(), (position.x, position.y));
     }
-
+    // Press up to drop all the way
     if keyboard_input.just_pressed(KeyCode::I) || keyboard_input.just_pressed(KeyCode::Up) {
         while check_tetromino_positions(&mut current_query, &mut heap_query) {
             for (_entity, mut position, _tetromino, _current) in current_query.iter_mut() {
                 position.y -= 1;
             }
         }
-
+        // We intersect, so we move up and move tetromino blocks into heap
         for (entity, mut position, _tetromino, _current) in current_query.iter_mut() {
             position.y += 1;
-            commands.remove_one::<CurrentTetromino>(entity);
-            commands.insert_one(entity, Heap);
+            commands.entity(entity)
+                .remove::<CurrentTetromino>()
+                .insert(Heap)
+                ;
+            //commands.remove_one::<CurrentTetromino>(entity);
+            //commands.insert_one(entity, Heap);
         }
-
+        //clear_full_layers(commands, &mut heap_query);
         for matrix in matrix_query.iter_mut() {
-            spawn_current_tetromino(commands, matrix, &mut materials);
+            spawn_current_tetromino(&mut commands, matrix, &mut materials);
         }
 
         return;
     }
 
     // Movement
-    soft_drop_timer.0.tick(time.delta_seconds());
 
     let mut move_x = 0;
     let mut move_y = 0;
@@ -176,7 +217,7 @@ fn move_current_tetromino(
     }
 
     let mut x_over = 0;
-    let mut y_over = 0;
+    let y_over = 0;
 
     for (_entity, mut position, mut tetromino, _current) in current_query.iter_mut() {
         let mut move_x = move_x;
@@ -208,7 +249,7 @@ fn move_current_tetromino(
         position.y += move_y;
     }
 
-    for (_entity, mut position, mut tetromino, _current) in current_query.iter_mut() {
+    for (_entity, mut position, mut _tetromino, _current) in current_query.iter_mut() {
         position.x -= x_over;
         position.y -= y_over;
     }
@@ -242,13 +283,18 @@ fn move_current_tetromino(
         } else {
             // Revert movement and add to heap
             for (entity, _position, _tetromino, _current) in current_query.iter_mut() {
-                commands.remove_one::<CurrentTetromino>(entity);
-                commands.insert_one(entity, Heap);
+                commands.entity(entity)
+                    .remove::<CurrentTetromino>()
+                    .insert(Heap)
+                    ;
+                //commands.remove_one::<CurrentTetromino>(entity);
+                //commands.insert_one(entity, Heap);
             }
-
+            //clear_full_layers(commands, &mut heap_query);
             for matrix in matrix_query.iter_mut() {
-                spawn_current_tetromino(commands, matrix, &mut materials);
+                spawn_current_tetromino(&mut commands, matrix, &mut materials);
             }
+            
         }
 
         if should_revert {
@@ -263,12 +309,17 @@ fn move_current_tetromino(
 
 fn update_block_sprites(
     mut matrix_query: Query<(&Matrix, &Sprite)>,
-    mut block_query: Query<(&MatrixPosition, &mut Transform)>
+    mut block_query: Query<(&MatrixPosition, &mut Transform)>,
+    time: Res<Time>,
+    mut updatetimer: ResMut<UpdateTimer>
 ) {
+    updatetimer.0.tick(time.delta());
     for (_matrix, matrix_sprite) in matrix_query.iter_mut() {
         for (position, mut transform) in block_query.iter_mut() {
-            let new_x: f32 = ((position.x as f32 * Block::SIZE) - (matrix_sprite.size.x * 0.5)) + (Block::SIZE * 0.5);
-            let new_y: f32 = (matrix_sprite.size.y * -0.5) + (position.y as f32 * Block::SIZE) + (Block::SIZE * 0.5);
+//             let new_x: f32 = ((position.x as f32 * Block::SIZE) - (matrix_sprite.custom_size.x * 0.5)) + (Block::SIZE * 0.5);
+//             let new_y: f32 = (matrix_sprite.size.y * -0.5) + (position.y as f32 * Block::SIZE) + (Block::SIZE * 0.5);
+            let new_x: f32 = ((position.x as f32 * Block::SIZE) - (matrix_sprite.custom_size.unwrap().x * 0.5)) + (Block::SIZE * 0.5);
+            let new_y: f32 = (matrix_sprite.custom_size.unwrap().y * -0.5) + (position.y as f32 * Block::SIZE) + (Block::SIZE * 0.5);
 
             let translation = &mut transform.translation;
             translation.x = new_x;
@@ -280,6 +331,42 @@ fn update_block_sprites(
 // ----------------
 // UTILITY AND IMPL
 // ----------------
+
+fn clear_full_layers(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut updatetimer: ResMut<UpdateTimer>,
+    mut heap_query: Query<(Entity, &mut MatrixPosition, &Heap)>
+    ) {
+    let width: i32 = 10;
+    let height: i32 = 22;
+    //bug, called with old heap rather than one given as command
+    let mut cond: bool = false;
+    updatetimer.0.tick(time.delta());
+    for y in 0..height {
+        for x in 0..width {
+            cond = false;
+            for (_ent, heap_position, _heap) in heap_query.iter_mut() {
+                if heap_position.x==x && heap_position.y==y {
+                
+                    cond = true;
+                    break;
+                }
+            }
+            if cond == false {break;}
+        }
+        if cond == true {
+            println!("layer {} completed", y);
+            for (ent, mut heap_position, _heap) in heap_query.iter_mut() {
+                if heap_position.y==y {
+                    commands.entity(ent).despawn();
+                } else if heap_position.y > y {
+                    heap_position.y -= 1;
+                }
+            }
+        }
+    }
+}
 
 fn rotate_tetromino_block(tetromino_block: &mut Tetromino, matrix_size: i32, clockwise: bool) {
     let orig_x = tetromino_block.index.x;
@@ -297,15 +384,15 @@ fn rotate_tetromino_block(tetromino_block: &mut Tetromino, matrix_size: i32, clo
 }
 
 fn check_tetromino_positions(
-    current_query: &mut Query<(Entity, &mut MatrixPosition, &mut Tetromino, &CurrentTetromino)>,
-    heap_query: &mut Query<(&mut MatrixPosition, &Heap)>
+    current_query: &mut Query<(Entity, &mut MatrixPosition, &mut Tetromino, &CurrentTetromino), Without<Heap>>,
+    heap_query: &mut Query<(Entity, &mut MatrixPosition, &Heap)>
 ) -> bool {
     for (_entity, position, _tetromino, _current) in current_query.iter_mut() {
         if position.y < 0 {
             return false;
         }
 
-        for (heap_position, _heap) in heap_query.iter_mut() {
+        for (_ent, heap_position, _heap) in heap_query.iter_mut() {
             if position.x == heap_position.x && position.y == heap_position.y {
                 return false;
             }
@@ -318,28 +405,35 @@ fn check_tetromino_positions(
 fn spawn_current_tetromino(
     commands: &mut Commands,
     matrix: &Matrix,
-    materials: &mut ResMut<Assets<ColorMaterial>>,
+    _materials: &mut ResMut<Assets<ColorMaterial>>,
 ) {
     let blocks = Tetromino::blocks_from_type(rand::random());
     for block in blocks.into_iter() {
         let tetromino_matrix_size = Tetromino::SIZES[block.1.tetromino_type as usize];
-        commands
-            .spawn(SpriteBundle {
-                material: materials.add(Color::rgb(
+        
+        let mysprite = Sprite {
+            color: Color::rgb(
                     block.0.color.r(),
                     block.0.color.g(),
                     block.0.color.b()
-                ).into()),
-                sprite: Sprite::new(Vec2::new(Block::SIZE, Block::SIZE)),
+                    ).into(),
+            flip_x: false,
+            flip_y: false,
+            custom_size: Some(Vec2::new(Block::SIZE, Block::SIZE)),
+        };
+        commands
+            .spawn()
+            .insert_bundle(SpriteBundle {
+                sprite: mysprite,
                 transform: Transform::from_translation(Vec3::new(0.0, 0.0, 1.0)),
                 ..Default::default()
             })
-            .with(CurrentTetromino)
-            .with(MatrixPosition {
+            .insert(CurrentTetromino)
+            .insert(MatrixPosition {
                 x: block.1.index.x + 3,
                 y: matrix.height - tetromino_matrix_size + block.1.index.y,
             })
-            .with_bundle(block)
+            .insert_bundle(block)
         ;
     }
 }
